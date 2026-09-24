@@ -58,7 +58,7 @@ With the served model **selected** in the table, press `b`. Because the model is
 
 ![Benchmark this model — live run against llama.cpp](../assets/benchmark-guide-bench.png)
 
-The **Benchmark this model** popup shows the model and provider it will measure. Press `Enter` to start — llmfit runs three real inference passes against the running server, measuring tokens per second and time-to-first-token. Press `Esc` at any point to let it continue in the background while you browse the leaderboard.
+The **Benchmark this model** popup shows the model and provider it will measure. Press `Enter` to start — llmfit runs three real inference passes against the running server, measuring decode tokens per second and prompt prefill time when the provider exposes it (the `ttft_ms` field in JSON is prefill duration, not streaming TTFT). Press `Esc` at any point to let it continue in the background while you browse the leaderboard.
 
 | Key | Action |
 |-----|--------|

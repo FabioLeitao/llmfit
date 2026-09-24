@@ -965,7 +965,11 @@ AGENT USAGE:
         nats_url: String,
     },
 
-    /// Benchmark inference performance against running providers
+    /// Benchmark inference performance against running providers.
+    ///
+    /// Decode TPS uses provider-native decode timers when available (Ollama
+    /// `eval_duration`, llama-server `timings`). JSON `ttft_ms` is prompt
+    /// prefill time from the provider, not streaming time-to-first-token.
     Bench {
         /// Model name to benchmark (auto-detects provider if omitted)
         model: Option<String>,

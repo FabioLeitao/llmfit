@@ -1,7 +1,12 @@
 //! LLM inference benchmarking against Ollama and OpenAI-compatible endpoints.
 //!
-//! Measures time-to-first-token (TTFT), tokens per second (TPS),
+//! Measures decode tokens per second (TPS), prompt-processing throughput,
 //! and total latency using real inference requests.
+//!
+//! Ollama and llama-server (via OpenAI-compatible `timings`) report decode TPS
+//! from native decode timers. The `ttft_ms` field holds **prompt prefill
+//! duration** from those APIs (Ollama `prompt_eval_duration`, llama.cpp
+//! `prompt_ms`), not streaming time-to-first-token.
 
 use std::time::{Duration, Instant};
 
@@ -10,19 +15,29 @@ use crate::providers::{OpenAiEndpointIdentity, fetch_openai_model_list, openai_m
 /// Results from a single benchmark run.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BenchRun {
-    /// Time to first token in milliseconds, if measurable.
-    /// - Ollama: measured from `eval_duration` (accurate).
-    /// - vLLM/MLX: `None` — would require streaming to measure; only wall-clock
-    ///   total is available.
+    /// Prompt prefill duration in milliseconds when the provider reports it.
+    /// - Ollama: `prompt_eval_duration` (not true streaming TTFT).
+    /// - llama-server: `timings.prompt_ms` when present.
+    /// - vLLM/MLX without native timings: `None`.
     pub ttft_ms: Option<f64>,
-    /// Output tokens per second.
+    /// Decode (output) tokens per second.
     pub tps: f64,
+    /// Prompt prefill tokens per second when measurable from native timings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_tps: Option<f64>,
     /// Total request latency in milliseconds.
     pub total_ms: f64,
     /// Number of prompt tokens processed.
     pub prompt_tokens: u32,
     /// Number of output tokens generated.
     pub output_tokens: u32,
+    /// Model load time in milliseconds (Ollama `load_duration`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load_ms: Option<f64>,
+    /// Prompt tokens counted during prefill when the provider reports it
+    /// (Ollama `prompt_eval_count`, llama.cpp `timings.prompt_n`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_eval_count: Option<u32>,
 }
 
 /// Aggregated benchmark results across multiple runs.
@@ -144,6 +159,8 @@ pub(crate) struct OllamaGenResponse {
     #[serde(default)]
     pub(crate) prompt_eval_duration: Option<u64>, // nanoseconds
     #[serde(default)]
+    pub(crate) load_duration: Option<u64>, // nanoseconds
+    #[serde(default)]
     pub(crate) total_duration: Option<u64>, // nanoseconds
 }
 
@@ -215,12 +232,19 @@ fn ollama_generate(
     let total_wall = start.elapsed();
 
     // Ollama provides native timing in nanoseconds
-    let prompt_tokens = resp_body.prompt_eval_count.unwrap_or(0) as u32;
+    let prompt_eval_count = resp_body.prompt_eval_count.map(|n| n as u32);
+    let prompt_tokens = prompt_eval_count.unwrap_or(0);
     let output_tokens = resp_body.eval_count.unwrap_or(0) as u32;
+    let load_ms = resp_body.load_duration.map(|ns| ns as f64 / 1_000_000.0);
 
     let ttft_ms = resp_body
         .prompt_eval_duration
         .map(|ns| ns as f64 / 1_000_000.0);
+
+    let prefill_tps = match (resp_body.prompt_eval_count, resp_body.prompt_eval_duration) {
+        (Some(n), Some(ns)) => prefill_tps_from_ns(n, ns),
+        _ => None,
+    };
 
     let tps = ollama_tps(resp_body.eval_count, resp_body.eval_duration, total_wall);
 
@@ -232,9 +256,12 @@ fn ollama_generate(
     Ok(BenchRun {
         ttft_ms,
         tps,
+        prefill_tps,
         total_ms,
         prompt_tokens,
         output_tokens,
+        load_ms,
+        prompt_eval_count,
     })
 }
 
@@ -263,10 +290,56 @@ fn ollama_tps(eval_count: Option<u64>, eval_duration: Option<u64>, total_wall: D
     }
 }
 
+/// Decode throughput from llama.cpp `timings`, when present and plausible.
+fn prefill_tps_from_ns(tokens: u64, duration_ns: u64) -> Option<f64> {
+    if tokens > 0 && duration_ns > 0 {
+        let tps = tokens as f64 / (duration_ns as f64 / 1_000_000_000.0);
+        return is_plausible_tps(tps).then_some(tps);
+    }
+    None
+}
+
+fn prefill_tps_from_ms(tokens: u32, duration_ms: f64) -> Option<f64> {
+    if tokens > 0 && duration_ms > 0.0 {
+        let tps = tokens as f64 / (duration_ms / 1000.0);
+        return is_plausible_tps(tps).then_some(tps);
+    }
+    None
+}
+
+fn llamacpp_decode_tps(timings: &LlamaCppTimings) -> Option<f64> {
+    if is_plausible_tps(timings.predicted_per_second) {
+        return Some(timings.predicted_per_second);
+    }
+    if timings.predicted_n >= 2 && timings.predicted_ms > 0.0 {
+        let tps = timings.predicted_n as f64 / (timings.predicted_ms / 1000.0);
+        if is_plausible_tps(tps) {
+            return Some(tps);
+        }
+    }
+    None
+}
+
 // ── OpenAI-compatible benchmarking (vLLM, MLX) ────────────────────
 
 /// OpenAI-compatible chat completion response fields we care about.
 /// Shared with `quality.rs` — both modules talk to the same endpoints.
+/// llama-server native timing block (milliseconds, decode rate in tok/s).
+#[derive(serde::Deserialize, Default)]
+#[allow(dead_code)]
+pub(crate) struct LlamaCppTimings {
+    #[serde(default)]
+    pub(crate) prompt_n: u32,
+    #[serde(default)]
+    pub(crate) prompt_ms: f64,
+    #[serde(default)]
+    pub(crate) predicted_n: u32,
+    #[serde(default)]
+    pub(crate) predicted_ms: f64,
+    #[serde(default)]
+    pub(crate) predicted_per_second: f64,
+}
+
 #[derive(serde::Deserialize)]
 #[allow(dead_code)]
 pub(crate) struct ChatCompletionResponse {
@@ -274,6 +347,8 @@ pub(crate) struct ChatCompletionResponse {
     pub(crate) choices: Vec<ChatChoice>,
     #[serde(default)]
     pub(crate) usage: Option<ChatUsage>,
+    #[serde(default)]
+    pub(crate) timings: Option<LlamaCppTimings>,
 }
 
 #[derive(serde::Deserialize)]
@@ -368,23 +443,40 @@ fn openai_chat(url: &str, model: &str, prompt: &str, max_tokens: u32) -> Result<
     });
 
     let output_tokens = usage.completion_tokens;
-    let prompt_tokens = usage.prompt_tokens;
+    let mut prompt_tokens = usage.prompt_tokens;
 
-    // TTFT cannot be measured without streaming — set to None.
     let total_ms = total_wall.as_secs_f64() * 1000.0;
 
-    let tps = if output_tokens > 0 && total_wall.as_secs_f64() > 0.0 {
+    let wall_tps = if output_tokens > 0 && total_wall.as_secs_f64() > 0.0 {
         output_tokens as f64 / total_wall.as_secs_f64()
     } else {
         0.0
     };
 
+    let (ttft_ms, prefill_tps, tps, prompt_eval_count) =
+        if let Some(timings) = completion.timings.as_ref() {
+            if timings.prompt_n > 0 {
+                prompt_tokens = timings.prompt_n;
+            }
+            let ttft_ms = (timings.prompt_ms > 0.0).then_some(timings.prompt_ms);
+            let prefill_tps = prefill_tps_from_ms(timings.prompt_n, timings.prompt_ms);
+            let tps = llamacpp_decode_tps(timings).unwrap_or(wall_tps);
+            let prompt_eval_count = (timings.prompt_n > 0).then_some(timings.prompt_n);
+            (ttft_ms, prefill_tps, tps, prompt_eval_count)
+        } else {
+            // Prefill/decode split unavailable without streaming or native timings.
+            (None, None, wall_tps, None)
+        };
+
     Ok(BenchRun {
-        ttft_ms: None,
+        ttft_ms,
         tps,
+        prefill_tps,
         total_ms,
         prompt_tokens,
         output_tokens,
+        load_ms: None,
+        prompt_eval_count,
     })
 }
 
@@ -966,9 +1058,12 @@ impl BenchResult {
             self.summary.avg_tps, self.summary.min_tps, self.summary.max_tps
         );
         if let Some(ttft) = self.summary.avg_ttft_ms {
-            println!("  TTFT:     {:.0} ms avg", ttft);
+            println!(
+                "  Prefill:  {:.0} ms avg (ttft_ms; not streaming TTFT)",
+                ttft
+            );
         } else {
-            println!("  TTFT:     n/a (streaming required)");
+            println!("  Prefill:  n/a (no native prompt timing)");
         }
         println!("  Latency:  {:.0} ms avg", self.summary.avg_total_ms);
         println!(
@@ -978,7 +1073,7 @@ impl BenchResult {
         println!();
 
         // Per-run breakdown
-        println!("  Run  TPS      TTFT     Latency  Tokens");
+        println!("  Run  TPS      Prefill  Latency  Tokens");
         println!("  ───  ───────  ───────  ───────  ──────");
         for (i, run) in self.runs.iter().enumerate() {
             println!("{}", format_run_row(i + 1, run));
@@ -1151,6 +1246,95 @@ mod tests {
             }
         });
         format!("http://{}", addr)
+    }
+
+    const CHAT_COMPLETION_LLAMACPP_TIMINGS_FIXTURE: &str = r#"{"choices":[{"message":{"content":"hello"}}],"usage":{"prompt_tokens":3,"completion_tokens":50},"timings":{"prompt_n":128,"prompt_ms":40.0,"predicted_n":50,"predicted_ms":2000.0,"predicted_per_second":25.0}}"#;
+
+    #[test]
+    fn openai_chat_uses_llamacpp_timings_when_present() {
+        let url = serve_fixture(CHAT_COMPLETION_LLAMACPP_TIMINGS_FIXTURE);
+        let run = openai_chat(&url, "test-model", "Say hello.", 100)
+            .expect("fixture chat should succeed");
+        assert!((run.ttft_ms.unwrap() - 40.0).abs() < 0.01);
+        assert!((run.tps - 25.0).abs() < 0.01);
+        assert!((run.prefill_tps.unwrap() - 3200.0).abs() < 0.1);
+        assert_eq!(run.prompt_tokens, 128);
+        assert_eq!(run.output_tokens, 50);
+    }
+
+    #[test]
+    fn ollama_generate_reports_prefill_tok_per_sec() {
+        let body = r#"{"response":"hi","eval_count":10,"eval_duration":2000000000,"prompt_eval_count":100,"prompt_eval_duration":500000000,"load_duration":1200000000}"#;
+        let base = serve_fixture(body);
+        let url = format!("{}/api/generate", base.trim_end_matches('/'));
+        let run = ollama_generate(&url, "m", "p", 10).expect("fixture ollama");
+        assert!((run.prefill_tps.unwrap() - 200.0).abs() < 0.01);
+        assert_eq!(run.prompt_tokens, 100);
+        assert_eq!(run.prompt_eval_count, Some(100));
+        assert!((run.load_ms.unwrap() - 1200.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn openai_chat_reports_prompt_eval_count_from_timings() {
+        let url = serve_fixture(CHAT_COMPLETION_LLAMACPP_TIMINGS_FIXTURE);
+        let run = openai_chat(&url, "test-model", "Say hello.", 100)
+            .expect("fixture chat should succeed");
+        assert_eq!(run.prompt_eval_count, Some(128));
+        assert!(run.load_ms.is_none());
+    }
+
+    #[test]
+    fn bench_run_json_omits_absent_load_and_prompt_eval_count() {
+        let run = BenchRun {
+            ttft_ms: None,
+            tps: 1.0,
+            prefill_tps: None,
+            total_ms: 10.0,
+            prompt_tokens: 1,
+            output_tokens: 1,
+            load_ms: None,
+            prompt_eval_count: None,
+        };
+        let json: serde_json::Value = serde_json::to_value(&run).expect("serialize");
+        assert!(json.get("load_ms").is_none());
+        assert!(json.get("prompt_eval_count").is_none());
+    }
+
+    #[test]
+    fn bench_run_json_omits_absent_prefill_tps() {
+        let mut run = BenchRun {
+            ttft_ms: Some(10.0),
+            tps: 5.0,
+            prefill_tps: None,
+            total_ms: 100.0,
+            prompt_tokens: 3,
+            output_tokens: 2,
+            load_ms: None,
+            prompt_eval_count: None,
+        };
+        let json: serde_json::Value = serde_json::to_value(&run).expect("serialize");
+        assert!(json.get("prefill_tps").is_none());
+        run.prefill_tps = Some(500.0);
+        let json: serde_json::Value = serde_json::to_value(&run).expect("serialize");
+        assert_eq!(json["prefill_tps"], 500.0);
+    }
+
+    #[test]
+    fn openai_chat_derives_decode_tps_from_predicted_n_and_ms() {
+        let body = r#"{"choices":[{"message":{"content":"x"}}],"usage":{"prompt_tokens":1,"completion_tokens":10},"timings":{"prompt_n":10,"prompt_ms":5.0,"predicted_n":10,"predicted_ms":500.0,"predicted_per_second":0.0}}"#;
+        let url = serve_fixture(body);
+        let run = openai_chat(&url, "m", "p", 100).expect("fixture");
+        assert!((run.tps - 20.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn openai_chat_without_timings_keeps_wall_clock_tps_and_no_ttft() {
+        let url = serve_fixture(CHAT_COMPLETION_FIXTURE);
+        let run = openai_chat(&url, "test-model", "Say hello.", 100)
+            .expect("fixture chat should succeed");
+        assert_eq!(run.ttft_ms, None);
+        assert_eq!(run.output_tokens, 2);
+        assert!(run.tps > 0.0);
     }
 
     #[test]
@@ -1404,9 +1588,12 @@ mod tests {
         BenchRun {
             ttft_ms: Some(ttft_ms),
             tps,
+            prefill_tps: None,
             total_ms,
             prompt_tokens: 10,
             output_tokens,
+            load_ms: None,
+            prompt_eval_count: None,
         }
     }
 
@@ -1415,16 +1602,22 @@ mod tests {
         let missing = BenchRun {
             ttft_ms: None,
             tps: 1.3,
+            prefill_tps: None,
             total_ms: 222_367.0,
             prompt_tokens: 10,
             output_tokens: 300,
+            load_ms: None,
+            prompt_eval_count: None,
         };
         let present = BenchRun {
             ttft_ms: Some(41.0),
             tps: 1.5,
+            prefill_tps: None,
             total_ms: 206_647.0,
             prompt_tokens: 10,
             output_tokens: 300,
+            load_ms: None,
+            prompt_eval_count: None,
         };
 
         assert_eq!(
