@@ -263,10 +263,40 @@ fn ollama_tps(eval_count: Option<u64>, eval_duration: Option<u64>, total_wall: D
     }
 }
 
+/// Decode throughput from llama.cpp `timings`, when present and plausible.
+fn llamacpp_decode_tps(timings: &LlamaCppTimings) -> Option<f64> {
+    if is_plausible_tps(timings.predicted_per_second) {
+        return Some(timings.predicted_per_second);
+    }
+    if timings.predicted_n >= 2 && timings.predicted_ms > 0.0 {
+        let tps = timings.predicted_n as f64 / (timings.predicted_ms / 1000.0);
+        if is_plausible_tps(tps) {
+            return Some(tps);
+        }
+    }
+    None
+}
+
 // ── OpenAI-compatible benchmarking (vLLM, MLX) ────────────────────
 
 /// OpenAI-compatible chat completion response fields we care about.
 /// Shared with `quality.rs` — both modules talk to the same endpoints.
+/// llama-server native timing block (milliseconds, decode rate in tok/s).
+#[derive(serde::Deserialize, Default)]
+#[allow(dead_code)]
+pub(crate) struct LlamaCppTimings {
+    #[serde(default)]
+    pub(crate) prompt_n: u32,
+    #[serde(default)]
+    pub(crate) prompt_ms: f64,
+    #[serde(default)]
+    pub(crate) predicted_n: u32,
+    #[serde(default)]
+    pub(crate) predicted_ms: f64,
+    #[serde(default)]
+    pub(crate) predicted_per_second: f64,
+}
+
 #[derive(serde::Deserialize)]
 #[allow(dead_code)]
 pub(crate) struct ChatCompletionResponse {
@@ -274,6 +304,8 @@ pub(crate) struct ChatCompletionResponse {
     pub(crate) choices: Vec<ChatChoice>,
     #[serde(default)]
     pub(crate) usage: Option<ChatUsage>,
+    #[serde(default)]
+    pub(crate) timings: Option<LlamaCppTimings>,
 }
 
 #[derive(serde::Deserialize)]
@@ -368,19 +400,30 @@ fn openai_chat(url: &str, model: &str, prompt: &str, max_tokens: u32) -> Result<
     });
 
     let output_tokens = usage.completion_tokens;
-    let prompt_tokens = usage.prompt_tokens;
+    let mut prompt_tokens = usage.prompt_tokens;
 
-    // TTFT cannot be measured without streaming — set to None.
     let total_ms = total_wall.as_secs_f64() * 1000.0;
 
-    let tps = if output_tokens > 0 && total_wall.as_secs_f64() > 0.0 {
+    let wall_tps = if output_tokens > 0 && total_wall.as_secs_f64() > 0.0 {
         output_tokens as f64 / total_wall.as_secs_f64()
     } else {
         0.0
     };
 
+    let (ttft_ms, tps) = if let Some(timings) = completion.timings.as_ref() {
+        if timings.prompt_n > 0 {
+            prompt_tokens = timings.prompt_n;
+        }
+        let ttft_ms = (timings.prompt_ms > 0.0).then_some(timings.prompt_ms);
+        let tps = llamacpp_decode_tps(timings).unwrap_or(wall_tps);
+        (ttft_ms, tps)
+    } else {
+        // TTFT cannot be measured without streaming or native timings.
+        (None, wall_tps)
+    };
+
     Ok(BenchRun {
-        ttft_ms: None,
+        ttft_ms,
         tps,
         total_ms,
         prompt_tokens,
@@ -1151,6 +1194,37 @@ mod tests {
             }
         });
         format!("http://{}", addr)
+    }
+
+    const CHAT_COMPLETION_LLAMACPP_TIMINGS_FIXTURE: &str = r#"{"choices":[{"message":{"content":"hello"}}],"usage":{"prompt_tokens":3,"completion_tokens":50},"timings":{"prompt_n":128,"prompt_ms":40.0,"predicted_n":50,"predicted_ms":2000.0,"predicted_per_second":25.0}}"#;
+
+    #[test]
+    fn openai_chat_uses_llamacpp_timings_when_present() {
+        let url = serve_fixture(CHAT_COMPLETION_LLAMACPP_TIMINGS_FIXTURE);
+        let run = openai_chat(&url, "test-model", "Say hello.", 100)
+            .expect("fixture chat should succeed");
+        assert!((run.ttft_ms.unwrap() - 40.0).abs() < 0.01);
+        assert!((run.tps - 25.0).abs() < 0.01);
+        assert_eq!(run.prompt_tokens, 128);
+        assert_eq!(run.output_tokens, 50);
+    }
+
+    #[test]
+    fn openai_chat_derives_decode_tps_from_predicted_n_and_ms() {
+        let body = r#"{"choices":[{"message":{"content":"x"}}],"usage":{"prompt_tokens":1,"completion_tokens":10},"timings":{"prompt_n":10,"prompt_ms":5.0,"predicted_n":10,"predicted_ms":500.0,"predicted_per_second":0.0}}"#;
+        let url = serve_fixture(body);
+        let run = openai_chat(&url, "m", "p", 100).expect("fixture");
+        assert!((run.tps - 20.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn openai_chat_without_timings_keeps_wall_clock_tps_and_no_ttft() {
+        let url = serve_fixture(CHAT_COMPLETION_FIXTURE);
+        let run = openai_chat(&url, "test-model", "Say hello.", 100)
+            .expect("fixture chat should succeed");
+        assert_eq!(run.ttft_ms, None);
+        assert_eq!(run.output_tokens, 2);
+        assert!(run.tps > 0.0);
     }
 
     #[test]
