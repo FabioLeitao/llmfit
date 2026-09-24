@@ -31,6 +31,13 @@ pub struct BenchRun {
     pub prompt_tokens: u32,
     /// Number of output tokens generated.
     pub output_tokens: u32,
+    /// Model load time in milliseconds (Ollama `load_duration`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load_ms: Option<f64>,
+    /// Prompt tokens counted during prefill when the provider reports it
+    /// (Ollama `prompt_eval_count`, llama.cpp `timings.prompt_n`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_eval_count: Option<u32>,
 }
 
 /// Aggregated benchmark results across multiple runs.
@@ -152,6 +159,8 @@ pub(crate) struct OllamaGenResponse {
     #[serde(default)]
     pub(crate) prompt_eval_duration: Option<u64>, // nanoseconds
     #[serde(default)]
+    pub(crate) load_duration: Option<u64>, // nanoseconds
+    #[serde(default)]
     pub(crate) total_duration: Option<u64>, // nanoseconds
 }
 
@@ -223,8 +232,10 @@ fn ollama_generate(
     let total_wall = start.elapsed();
 
     // Ollama provides native timing in nanoseconds
-    let prompt_tokens = resp_body.prompt_eval_count.unwrap_or(0) as u32;
+    let prompt_eval_count = resp_body.prompt_eval_count.map(|n| n as u32);
+    let prompt_tokens = prompt_eval_count.unwrap_or(0);
     let output_tokens = resp_body.eval_count.unwrap_or(0) as u32;
+    let load_ms = resp_body.load_duration.map(|ns| ns as f64 / 1_000_000.0);
 
     let ttft_ms = resp_body
         .prompt_eval_duration
@@ -249,6 +260,8 @@ fn ollama_generate(
         total_ms,
         prompt_tokens,
         output_tokens,
+        load_ms,
+        prompt_eval_count,
     })
 }
 
@@ -440,18 +453,20 @@ fn openai_chat(url: &str, model: &str, prompt: &str, max_tokens: u32) -> Result<
         0.0
     };
 
-    let (ttft_ms, prefill_tps, tps) = if let Some(timings) = completion.timings.as_ref() {
-        if timings.prompt_n > 0 {
-            prompt_tokens = timings.prompt_n;
-        }
-        let ttft_ms = (timings.prompt_ms > 0.0).then_some(timings.prompt_ms);
-        let prefill_tps = prefill_tps_from_ms(timings.prompt_n, timings.prompt_ms);
-        let tps = llamacpp_decode_tps(timings).unwrap_or(wall_tps);
-        (ttft_ms, prefill_tps, tps)
-    } else {
-        // Prefill/decode split unavailable without streaming or native timings.
-        (None, None, wall_tps)
-    };
+    let (ttft_ms, prefill_tps, tps, prompt_eval_count) =
+        if let Some(timings) = completion.timings.as_ref() {
+            if timings.prompt_n > 0 {
+                prompt_tokens = timings.prompt_n;
+            }
+            let ttft_ms = (timings.prompt_ms > 0.0).then_some(timings.prompt_ms);
+            let prefill_tps = prefill_tps_from_ms(timings.prompt_n, timings.prompt_ms);
+            let tps = llamacpp_decode_tps(timings).unwrap_or(wall_tps);
+            let prompt_eval_count = (timings.prompt_n > 0).then_some(timings.prompt_n);
+            (ttft_ms, prefill_tps, tps, prompt_eval_count)
+        } else {
+            // Prefill/decode split unavailable without streaming or native timings.
+            (None, None, wall_tps, None)
+        };
 
     Ok(BenchRun {
         ttft_ms,
@@ -460,6 +475,8 @@ fn openai_chat(url: &str, model: &str, prompt: &str, max_tokens: u32) -> Result<
         total_ms,
         prompt_tokens,
         output_tokens,
+        load_ms: None,
+        prompt_eval_count,
     })
 }
 
@@ -1247,12 +1264,40 @@ mod tests {
 
     #[test]
     fn ollama_generate_reports_prefill_tok_per_sec() {
-        let body = r#"{"response":"hi","eval_count":10,"eval_duration":2000000000,"prompt_eval_count":100,"prompt_eval_duration":500000000}"#;
+        let body = r#"{"response":"hi","eval_count":10,"eval_duration":2000000000,"prompt_eval_count":100,"prompt_eval_duration":500000000,"load_duration":1200000000}"#;
         let base = serve_fixture(body);
         let url = format!("{}/api/generate", base.trim_end_matches('/'));
         let run = ollama_generate(&url, "m", "p", 10).expect("fixture ollama");
         assert!((run.prefill_tps.unwrap() - 200.0).abs() < 0.01);
         assert_eq!(run.prompt_tokens, 100);
+        assert_eq!(run.prompt_eval_count, Some(100));
+        assert!((run.load_ms.unwrap() - 1200.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn openai_chat_reports_prompt_eval_count_from_timings() {
+        let url = serve_fixture(CHAT_COMPLETION_LLAMACPP_TIMINGS_FIXTURE);
+        let run = openai_chat(&url, "test-model", "Say hello.", 100)
+            .expect("fixture chat should succeed");
+        assert_eq!(run.prompt_eval_count, Some(128));
+        assert!(run.load_ms.is_none());
+    }
+
+    #[test]
+    fn bench_run_json_omits_absent_load_and_prompt_eval_count() {
+        let run = BenchRun {
+            ttft_ms: None,
+            tps: 1.0,
+            prefill_tps: None,
+            total_ms: 10.0,
+            prompt_tokens: 1,
+            output_tokens: 1,
+            load_ms: None,
+            prompt_eval_count: None,
+        };
+        let json: serde_json::Value = serde_json::to_value(&run).expect("serialize");
+        assert!(json.get("load_ms").is_none());
+        assert!(json.get("prompt_eval_count").is_none());
     }
 
     #[test]
@@ -1264,6 +1309,8 @@ mod tests {
             total_ms: 100.0,
             prompt_tokens: 3,
             output_tokens: 2,
+            load_ms: None,
+            prompt_eval_count: None,
         };
         let json: serde_json::Value = serde_json::to_value(&run).expect("serialize");
         assert!(json.get("prefill_tps").is_none());
@@ -1545,6 +1592,8 @@ mod tests {
             total_ms,
             prompt_tokens: 10,
             output_tokens,
+            load_ms: None,
+            prompt_eval_count: None,
         }
     }
 
@@ -1557,6 +1606,8 @@ mod tests {
             total_ms: 222_367.0,
             prompt_tokens: 10,
             output_tokens: 300,
+            load_ms: None,
+            prompt_eval_count: None,
         };
         let present = BenchRun {
             ttft_ms: Some(41.0),
@@ -1565,6 +1616,8 @@ mod tests {
             total_ms: 206_647.0,
             prompt_tokens: 10,
             output_tokens: 300,
+            load_ms: None,
+            prompt_eval_count: None,
         };
 
         assert_eq!(
