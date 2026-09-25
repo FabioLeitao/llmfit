@@ -20,6 +20,7 @@
 //! output on stdout.
 
 use crate::bench::BenchResult;
+use crate::benchmark_model_id::normalize_benchmark_model_id;
 use crate::hardware::SystemSpecs;
 use base64::Engine;
 use serde::Serialize;
@@ -90,6 +91,8 @@ struct HwPayload {
 #[serde(rename_all = "camelCase")]
 struct ResultPayload {
     model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_opaque: Option<bool>,
     provider: String,
     num_runs: usize,
     avg_tps: f64,
@@ -159,19 +162,20 @@ fn build_submission(results: &[BenchResult], specs: &SystemSpecs) -> Submission 
 
     let results = results
         .iter()
-        .map(|r| ResultPayload {
-            // For the llamacpp provider `r.model` is the id reported by
-            // llama-server, which is usually the absolute path of the loaded
-            // GGUF. Store the bare file name instead (#819).
-            model: strip_gguf_path(&r.model),
-            provider: r.provider.clone(),
-            num_runs: r.summary.num_runs,
-            avg_tps: round2(r.summary.avg_tps),
-            min_tps: round2(r.summary.min_tps),
-            max_tps: round2(r.summary.max_tps),
-            avg_ttft_ms: r.summary.avg_ttft_ms.map(round2),
-            avg_total_ms: round2(r.summary.avg_total_ms),
-            avg_output_tokens: round2(r.summary.avg_output_tokens),
+        .map(|r| {
+            let normalized = normalize_benchmark_model_id(&r.model);
+            ResultPayload {
+                model: normalized.id,
+                model_opaque: normalized.opaque.then_some(true),
+                provider: r.provider.clone(),
+                num_runs: r.summary.num_runs,
+                avg_tps: round2(r.summary.avg_tps),
+                min_tps: round2(r.summary.min_tps),
+                max_tps: round2(r.summary.max_tps),
+                avg_ttft_ms: r.summary.avg_ttft_ms.map(round2),
+                avg_total_ms: round2(r.summary.avg_total_ms),
+                avg_output_tokens: round2(r.summary.avg_output_tokens),
+            }
         })
         .collect();
 
@@ -323,33 +327,7 @@ fn store_root() -> Option<PathBuf> {
     Some(dirs::data_local_dir()?.join("llmfit").join("benchmarks"))
 }
 
-/// llama-server reports the value of its `-m/--model` argument, usually an
-/// absolute filesystem path to a GGUF, as the model id in its
-/// OpenAI-compatible `/v1/models` listing, and that id ends up verbatim in
-/// `BenchResult::model`. Keep only the file name when the value is a path to
-/// a `.gguf` file, so no machine-specific directory (often a username) leaks
-/// into a stored submission (#819). Every other id shape (Ollama tags,
-/// HF-style `org/model` ids from vLLM or MLX, bare file names) passes
-/// through unchanged.
-///
-/// Only ids that look like absolute paths are stripped (leading `/` or `\\`,
-/// or a Windows drive letter), so Hub-style references such as
-/// `hf.co/org/repo/file.gguf` keep their namespace: they contain separators
-/// and end in `.gguf` but carry nothing machine-specific. Splits on both
-/// separator kinds, like `tag_matches_model` does: a Windows path can show
-/// up verbatim in the listing.
-fn strip_gguf_path(id: &str) -> String {
-    let is_absolute = id.starts_with('/')
-        || id.starts_with('\\')
-        || matches!(id.as_bytes(), [_, b':', b'/' | b'\\', ..]);
-    if is_absolute && id.to_ascii_lowercase().ends_with(".gguf") {
-        id.rsplit(['/', '\\']).next().unwrap_or(id).to_string()
-    } else {
-        id.to_string()
-    }
-}
-
-/// Rewrite absolute GGUF paths left in the `model` field of a stored payload.
+/// Rewrite model ids and drop local-only fields from a stored payload.
 /// New payloads are normalised in `build_submission`, but stores written by
 /// older binaries still carry paths (#819). Scrubbing at load time means the
 /// share listing, the `--dry-run` preview and the upload all agree, and no
@@ -357,11 +335,14 @@ fn strip_gguf_path(id: &str) -> String {
 fn sanitize_stored_payload(payload: &mut Value) {
     if let Some(results) = payload.get_mut("results").and_then(Value::as_array_mut) {
         for r in results {
-            if let Some(model) = r["model"].as_str() {
-                let stripped = strip_gguf_path(model);
-                if stripped != model {
-                    r["model"] = Value::String(stripped);
+            if let Some(obj) = r.as_object_mut() {
+                if let Some(model) = obj.get("model").and_then(Value::as_str) {
+                    let normalized = normalize_benchmark_model_id(model);
+                    if normalized.id != model {
+                        obj.insert("model".to_string(), Value::String(normalized.id));
+                    }
                 }
+                obj.remove("modelOpaque");
             }
         }
     }
@@ -1555,46 +1536,6 @@ mod tests {
     }
 
     #[test]
-    fn strip_gguf_path_keeps_only_the_file_name_for_gguf_paths() {
-        assert_eq!(
-            strip_gguf_path("/home/user/gguf/SmolLM2-135M-Instruct-Q4_K_M.gguf"),
-            "SmolLM2-135M-Instruct-Q4_K_M.gguf"
-        );
-        assert_eq!(
-            strip_gguf_path(r"C:\models\phi-4-Q4_K_M.GGUF"),
-            "phi-4-Q4_K_M.GGUF"
-        );
-    }
-
-    #[test]
-    fn strip_gguf_path_leaves_non_path_ids_untouched() {
-        // Ollama tag.
-        assert_eq!(strip_gguf_path("llama3.1:8b"), "llama3.1:8b");
-        // HF-style id from vLLM or MLX: contains a slash but is not a file.
-        assert_eq!(
-            strip_gguf_path("meta-llama/Llama-3.1-8B-Instruct"),
-            "meta-llama/Llama-3.1-8B-Instruct"
-        );
-        // GGUF repo id: ends in "GGUF" but not ".gguf".
-        assert_eq!(
-            strip_gguf_path("unsloth/Qwen3-4B-GGUF"),
-            "unsloth/Qwen3-4B-GGUF"
-        );
-        // Already a bare file name.
-        assert_eq!(strip_gguf_path("model.gguf"), "model.gguf");
-        // Hub-style reference: separators and a .gguf suffix, but relative,
-        // so the org and repo context must survive.
-        assert_eq!(
-            strip_gguf_path(
-                "hf.co/bartowski/SmolLM2-135M-Instruct-GGUF/SmolLM2-135M-Instruct-Q4_K_M.gguf"
-            ),
-            "hf.co/bartowski/SmolLM2-135M-Instruct-GGUF/SmolLM2-135M-Instruct-Q4_K_M.gguf"
-        );
-        // Relative filesystem path: nothing machine-specific to hide.
-        assert_eq!(strip_gguf_path("models/foo.gguf"), "models/foo.gguf");
-    }
-
-    #[test]
     fn sanitize_stored_payload_scrubs_absolute_model_paths() {
         let mut payload = json!({
             "results": [
@@ -1605,6 +1546,54 @@ mod tests {
         sanitize_stored_payload(&mut payload);
         assert_eq!(payload["results"][0]["model"], "phi-4-Q4_K_M.gguf");
         assert_eq!(payload["results"][1]["model"], "llama3.1:8b");
+    }
+
+    #[test]
+    fn sanitize_stored_payload_scrubs_ollama_blob_paths() {
+        let mut payload = json!({
+            "results": [{
+                "model": "/usr/share/ollama/.ollama/models/blobs/sha256-dde5aa3fc5ffc17176b5e8bdc82f587b24b2678c6c66101bf7da77af9f7ccdff",
+                "modelOpaque": true
+            }]
+        });
+        sanitize_stored_payload(&mut payload);
+        assert_eq!(
+            payload["results"][0]["model"],
+            "sha256-dde5aa3fc5ffc17176b5e8bdc82f587b24b2678c6c66101bf7da77af9f7ccdff"
+        );
+        assert!(payload["results"][0].get("modelOpaque").is_none());
+    }
+
+    #[test]
+    fn build_submission_marks_opaque_absolute_paths() {
+        let mut result = sample_result();
+        result.model = "/var/lib/models/custom-manifest.json".to_string();
+        let payload =
+            serde_json::to_value(build_submission(&[result], &specs_with_gpu("GTX 1050 Ti")))
+                .unwrap();
+        assert_eq!(payload["results"][0]["model"], "custom-manifest.json");
+        assert_eq!(payload["results"][0]["modelOpaque"], true);
+    }
+
+    #[test]
+    fn sanitized_payload_with_local_opaque_field_validates_community_schema() {
+        let mut result = sample_result();
+        result.model = "/var/lib/models/custom-manifest.json".to_string();
+        let mut value =
+            serde_json::to_value(build_submission(&[result], &specs_with_gpu("GTX 1050 Ti")))
+                .unwrap();
+        sanitize_stored_payload(&mut value);
+
+        let schema_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data/community/schema.json");
+        let schema: Value =
+            serde_json::from_str(&std::fs::read_to_string(&schema_path).unwrap()).unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        let errors: Vec<String> = validator
+            .iter_errors(&value)
+            .map(|e| format!("  [{}] {}", e.instance_path(), e))
+            .collect();
+        assert!(errors.is_empty(), "{}", errors.join("\n"));
     }
 
     #[test]

@@ -950,23 +950,16 @@ fn detect_identified_openai_model(
 }
 
 /// llama-server reports the value passed to `--model` as its OpenAI model ID.
-/// When that value is a local GGUF path, retain only its filename so benchmark
-/// results do not expose local filesystem details or fragment model grouping.
+/// Normalise with the same rules as community benchmark storage.
 fn normalize_llamacpp_model_id(model_id: &str) -> String {
-    let is_gguf = model_id.to_ascii_lowercase().ends_with(".gguf");
-    let has_separator = model_id.contains(std::path::MAIN_SEPARATOR)
-        || (std::path::MAIN_SEPARATOR != '/' && model_id.contains('/'))
-        || (std::path::MAIN_SEPARATOR != '\\' && model_id.contains('\\'));
-
-    if is_gguf && has_separator {
-        model_id
-            .rsplit(['/', '\\'])
-            .next()
-            .unwrap_or(model_id)
-            .to_string()
-    } else {
-        model_id.to_string()
+    let normalized = crate::benchmark_model_id::normalize_benchmark_model_id(model_id);
+    if normalized.opaque {
+        eprintln!(
+            "  Warning: model id normalised to opaque basename `{}` (was a local path)",
+            normalized.id
+        );
     }
+    normalized.id
 }
 
 fn detect_openai_model(base_url: &str, hint: Option<&str>) -> Result<String, String> {
@@ -1580,7 +1573,7 @@ mod tests {
         assert_eq!(normalize_llamacpp_model_id("llama-3.2:3b"), "llama-3.2:3b");
         assert_eq!(
             normalize_llamacpp_model_id("/models/config.json"),
-            "/models/config.json"
+            "config.json"
         );
     }
 
