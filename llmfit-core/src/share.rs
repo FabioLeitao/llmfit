@@ -70,6 +70,8 @@ struct Submission {
 struct ToolInfo {
     name: &'static str,
     version: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    build: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -185,6 +187,7 @@ fn build_submission(results: &[BenchResult], specs: &SystemSpecs) -> Submission 
         tool: ToolInfo {
             name: "llmfit",
             version: env!("CARGO_PKG_VERSION"),
+            build: crate::version::build_revision(),
         },
         hardware: HwPayload {
             hw_class,
@@ -333,6 +336,9 @@ fn store_root() -> Option<PathBuf> {
 /// share listing, the `--dry-run` preview and the upload all agree, and no
 /// machine-specific path leaves the machine.
 fn sanitize_stored_payload(payload: &mut Value) {
+    if let Some(tool) = payload.get_mut("tool").and_then(Value::as_object_mut) {
+        tool.remove("build");
+    }
     if let Some(results) = payload.get_mut("results").and_then(Value::as_array_mut) {
         for r in results {
             if let Some(obj) = r.as_object_mut() {
@@ -1508,7 +1514,8 @@ mod tests {
             &[result, llamacpp_result, ferrum_result],
             &specs_with_gpu("NVIDIA GeForce RTX 4090"),
         );
-        let value = serde_json::to_value(&submission).unwrap();
+        let mut value = serde_json::to_value(&submission).unwrap();
+        sanitize_stored_payload(&mut value);
 
         let schema_path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data/community/schema.json");
@@ -1573,6 +1580,32 @@ mod tests {
                 .unwrap();
         assert_eq!(payload["results"][0]["model"], "custom-manifest.json");
         assert_eq!(payload["results"][0]["modelOpaque"], true);
+    }
+
+    #[test]
+    fn sanitize_stored_payload_strips_local_tool_build() {
+        let mut payload = json!({
+            "tool": {
+                "name": "llmfit",
+                "version": "1.1.16",
+                "build": "abc1234"
+            },
+            "results": [{ "model": "llama3.1:8b" }]
+        });
+        sanitize_stored_payload(&mut payload);
+        assert!(payload["tool"].get("build").is_none());
+    }
+
+    #[test]
+    fn build_submission_includes_tool_build_when_embedded() {
+        if let Some(sha) = crate::version::build_revision() {
+            let payload = serde_json::to_value(build_submission(
+                &[sample_result()],
+                &specs_with_gpu("GTX 1050 Ti"),
+            ))
+            .unwrap();
+            assert_eq!(payload["tool"]["build"], sha);
+        }
     }
 
     #[test]

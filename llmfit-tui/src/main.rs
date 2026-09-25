@@ -11,7 +11,7 @@ mod tui_app;
 mod tui_events;
 mod tui_ui;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::process::Stdio;
@@ -161,7 +161,6 @@ EXIT CODES:
 ENVIRONMENT VARIABLES:
   OLLAMA_CONTEXT_LENGTH  Default context-length cap when --max-context is not set.")]
 #[command(after_long_help = "For a compact summary, use -h instead of --help.")]
-#[command(version)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -3728,7 +3727,11 @@ fn display_routing_matrix_full(
 // ── main ───────────────────────────────────────────────────────────────────
 
 fn main() {
-    let cli = Cli::parse();
+    let cli = Cli::command()
+        .version(env!("CARGO_PKG_VERSION"))
+        .long_version(llmfit_core::version::long_version())
+        .get_matches();
+    let cli = Cli::from_arg_matches(&cli).unwrap_or_else(|e| e.exit());
     configure_llama_cpp_path(cli.llama_cpp_path.as_deref());
 
     let context_limit = resolve_context_limit(cli.max_context);
