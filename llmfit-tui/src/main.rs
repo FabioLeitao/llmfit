@@ -1028,6 +1028,13 @@ AGENT USAGE:
         /// With --share, skip the confirmation prompt
         #[arg(long)]
         yes: bool,
+
+        /// Do not append results to the local pending store (`pending/`).
+        /// Applies to CLI benchmark runs only (not the interactive bench TUI).
+        /// Incompatible with running a benchmark and `--share` in the same
+        /// command (use `bench --share` alone to upload stored results).
+        #[arg(long)]
+        no_store: bool,
     },
 }
 
@@ -3035,9 +3042,18 @@ fn run_bench(
     all: bool,
     json: bool,
     share_opts: Option<share::ShareOptions>,
+    no_store: bool,
     overrides: &HardwareOverrides,
 ) {
     let runs = runs as usize;
+
+    if no_store && share_opts.is_some() {
+        eprintln!(
+            "Error: --no-store cannot be used with --share while benchmarking; \
+             run the benchmark first, or use `llmfit bench --share` alone to upload pending results"
+        );
+        std::process::exit(1);
+    }
 
     // With --share, resolve and verify GitHub credentials up front so a
     // missing or expired token surfaces before minutes of benchmarking.
@@ -3115,7 +3131,7 @@ fn run_bench(
             });
             println!("{}", serde_json::to_string_pretty(&json_out).unwrap());
         }
-        store_bench_results(&results, overrides, share_opts.is_none());
+        store_bench_results(&results, overrides, !no_store, share_opts.is_none());
         if let Some(opts) = share_opts {
             share_pending_cli(&opts, share_token);
         }
@@ -3239,7 +3255,12 @@ fn run_bench(
             } else {
                 r.display();
             }
-            store_bench_results(std::slice::from_ref(&r), overrides, share_opts.is_none());
+            store_bench_results(
+                std::slice::from_ref(&r),
+                overrides,
+                !no_store,
+                share_opts.is_none(),
+            );
             if let Some(opts) = share_opts {
                 share_pending_cli(&opts, share_token);
             }
@@ -3253,8 +3274,13 @@ fn run_bench(
 
 /// Record successful benchmark results in the local store. With `hint`, tells
 /// the user where they went and how to contribute them later.
-fn store_bench_results(results: &[bench::BenchResult], overrides: &HardwareOverrides, hint: bool) {
-    if results.is_empty() {
+fn store_bench_results(
+    results: &[bench::BenchResult],
+    overrides: &HardwareOverrides,
+    store: bool,
+    hint: bool,
+) {
+    if !store || results.is_empty() {
         return;
     }
     let specs = detect_specs(overrides);
@@ -4103,6 +4129,7 @@ fn main() {
                 share,
                 dry_run,
                 yes,
+                no_store,
             } => {
                 // No model/flags → launch bench TUI view
                 let is_bare = model.is_none() && !all && !json && !quality && !routing && !share;
@@ -4139,7 +4166,7 @@ fn main() {
                         assume_yes: yes,
                     });
                     run_bench(
-                        model, &provider, url, runs, all, json, share_opts, &overrides,
+                        model, &provider, url, runs, all, json, share_opts, no_store, &overrides,
                     );
                 }
             }
