@@ -453,7 +453,7 @@ fn bench_offer_worker(
         let _ = progress_tx.send(BenchOfferMsg::Progress(msg));
     };
 
-    let result = bench::benchmark_target(&target, RUNS, &on_progress);
+    let result = bench::benchmark_target(&target, RUNS, &on_progress, None, false);
 
     let result = match result {
         Ok(r) => r,

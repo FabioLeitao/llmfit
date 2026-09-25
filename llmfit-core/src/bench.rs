@@ -10,6 +10,7 @@
 
 use std::time::{Duration, Instant};
 
+use crate::bench_prompt::{BenchPromptSpec, prompt_with_run_nonce};
 use crate::providers::{OpenAiEndpointIdentity, fetch_openai_model_list, openai_model_ids};
 
 /// Results from a single benchmark run.
@@ -47,6 +48,15 @@ pub struct BenchResult {
     pub provider: String,
     pub runs: Vec<BenchRun>,
     pub summary: BenchSummary,
+    /// Target prompt size when `--prompt-tokens` was used.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_prompt_tokens: Option<u32>,
+    /// Average prompt tokens counted by the provider during prefill.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub measured_prompt_tokens: Option<f64>,
+    /// Percent delta between requested and measured prompt tokens.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_token_delta_pct: Option<f64>,
 }
 
 /// Statistical summary of benchmark runs.
@@ -164,12 +174,82 @@ pub(crate) struct OllamaGenResponse {
     pub(crate) total_duration: Option<u64>, // nanoseconds
 }
 
+fn prompt_for_run(prompt: Option<&BenchPromptSpec>, run_index: usize) -> String {
+    if let Some(spec) = prompt {
+        prompt_with_run_nonce(&spec.text, run_index)
+    } else {
+        BENCH_PROMPTS[run_index % BENCH_PROMPTS.len()].to_string()
+    }
+}
+
+fn average_measured_prompt_tokens(runs: &[BenchRun]) -> Option<f64> {
+    let counts: Vec<f64> = runs
+        .iter()
+        .filter_map(|run| {
+            run.prompt_eval_count
+                .map(|n| n as f64)
+                .or_else(|| (run.prompt_tokens > 0).then_some(run.prompt_tokens as f64))
+        })
+        .collect();
+    if counts.is_empty() {
+        None
+    } else {
+        Some(counts.iter().sum::<f64>() / counts.len() as f64)
+    }
+}
+
+fn finalize_bench_result(
+    result: BenchResult,
+    prompt: Option<&BenchPromptSpec>,
+    strict_prompt_size: bool,
+) -> Result<BenchResult, String> {
+    let mut result = result;
+    if let Some(spec) = prompt {
+        result.requested_prompt_tokens = spec.requested_tokens;
+        let measured = average_measured_prompt_tokens(&result.runs);
+        result.measured_prompt_tokens = measured;
+        if let (Some(requested), Some(measured)) = (spec.requested_tokens, measured) {
+            if requested == 0 {
+                return Err("--prompt-tokens must be at least 1".to_string());
+            }
+            let delta_pct = ((measured - requested as f64) / requested as f64) * 100.0;
+            result.prompt_token_delta_pct = Some(delta_pct);
+            if strict_prompt_size && delta_pct.abs() > 2.0 {
+                return Err(format!(
+                    "measured prompt tokens {:.1} deviate {:.1}% from requested {} \
+                     (strict limit 2%)",
+                    measured, delta_pct, requested
+                ));
+            }
+        }
+    }
+    Ok(result)
+}
+
+fn ensure_custom_prompt_supported(
+    target: &BenchTarget,
+    prompt: Option<&BenchPromptSpec>,
+) -> Result<(), String> {
+    if prompt.is_none() {
+        return Ok(());
+    }
+    match target {
+        BenchTarget::Ollama { .. } | BenchTarget::LlamaCpp { .. } => Ok(()),
+        _ => Err(
+            "--prompt-file and --prompt-tokens are only supported for ollama and llamacpp \
+             benchmarks"
+                .to_string(),
+        ),
+    }
+}
+
 /// Benchmark a model via Ollama's /api/generate endpoint.
 pub fn bench_ollama(
     base_url: &str,
     model: &str,
     num_runs: usize,
     on_progress: &dyn Fn(usize, usize),
+    prompt: Option<&BenchPromptSpec>,
 ) -> Result<BenchResult, String> {
     let url = format!("{}/api/generate", base_url.trim_end_matches('/'));
     let mut runs = Vec::with_capacity(num_runs);
@@ -185,8 +265,8 @@ pub fn bench_ollama(
 
     for i in 0..num_runs {
         on_progress(i + 1, num_runs);
-        let prompt = BENCH_PROMPTS[i % BENCH_PROMPTS.len()];
-        let run = ollama_generate(&url, model, prompt, 300)?;
+        let prompt_text = prompt_for_run(prompt, i);
+        let run = ollama_generate(&url, model, &prompt_text, 300)?;
         runs.push(run);
     }
 
@@ -196,6 +276,9 @@ pub fn bench_ollama(
         provider: "ollama".to_string(),
         runs,
         summary,
+        requested_prompt_tokens: None,
+        measured_prompt_tokens: None,
+        prompt_token_delta_pct: None,
     })
 }
 
@@ -380,13 +463,14 @@ pub fn bench_openai_compat(
     provider_name: &str,
     num_runs: usize,
     on_progress: &dyn Fn(usize, usize),
+    prompt: Option<&BenchPromptSpec>,
 ) -> Result<BenchResult, String> {
     let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
     let mut runs = Vec::with_capacity(num_runs);
 
     // Warmup
     on_progress(0, num_runs);
-    if let Err(e) = openai_chat(&url, model, "Say hello.", 100) {
+    if let Err(e) = openai_chat(&url, model, "Say hello.", 100, false) {
         return Err(format!(
             "Warmup request failed (is the endpoint reachable?): {}",
             e
@@ -395,8 +479,8 @@ pub fn bench_openai_compat(
 
     for i in 0..num_runs {
         on_progress(i + 1, num_runs);
-        let prompt = BENCH_PROMPTS[i % BENCH_PROMPTS.len()];
-        let run = openai_chat(&url, model, prompt, 300)?;
+        let prompt_text = prompt_for_run(prompt, i);
+        let run = openai_chat(&url, model, &prompt_text, 300, prompt.is_some())?;
         runs.push(run);
     }
 
@@ -406,16 +490,35 @@ pub fn bench_openai_compat(
         provider: provider_name.to_string(),
         runs,
         summary,
+        requested_prompt_tokens: None,
+        measured_prompt_tokens: None,
+        prompt_token_delta_pct: None,
     })
 }
 
-fn openai_chat(url: &str, model: &str, prompt: &str, max_tokens: u32) -> Result<BenchRun, String> {
-    let body = serde_json::json!({
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": max_tokens,
-        "stream": false,
-    });
+fn openai_chat(
+    url: &str,
+    model: &str,
+    prompt: &str,
+    max_tokens: u32,
+    llamacpp_no_prompt_cache: bool,
+) -> Result<BenchRun, String> {
+    let body = if llamacpp_no_prompt_cache {
+        serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+            "stream": false,
+            "cache_prompt": false,
+        })
+    } else {
+        serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+            "stream": false,
+        })
+    };
 
     let start = Instant::now();
 
@@ -497,22 +600,28 @@ pub fn benchmark_target(
     target: &BenchTarget,
     num_runs: usize,
     on_progress: &dyn Fn(usize, usize),
+    prompt: Option<&BenchPromptSpec>,
+    strict_prompt_size: bool,
 ) -> Result<BenchResult, String> {
-    match target {
-        BenchTarget::Ollama { url, model } => bench_ollama(url, model, num_runs, on_progress),
+    ensure_custom_prompt_supported(target, prompt)?;
+    let result = match target {
+        BenchTarget::Ollama { url, model } => {
+            bench_ollama(url, model, num_runs, on_progress, prompt)
+        }
         BenchTarget::VLlm { url, model } => {
-            bench_openai_compat(url, model, "vllm", num_runs, on_progress)
+            bench_openai_compat(url, model, "vllm", num_runs, on_progress, None)
         }
         BenchTarget::Ferrum { url, model } => {
-            bench_openai_compat(url, model, "ferrum", num_runs, on_progress)
+            bench_openai_compat(url, model, "ferrum", num_runs, on_progress, None)
         }
         BenchTarget::Mlx { url, model } => {
-            bench_openai_compat(url, model, "mlx", num_runs, on_progress)
+            bench_openai_compat(url, model, "mlx", num_runs, on_progress, None)
         }
         BenchTarget::LlamaCpp { url, model } => {
-            bench_openai_compat(url, model, "llamacpp", num_runs, on_progress)
+            bench_openai_compat(url, model, "llamacpp", num_runs, on_progress, prompt)
         }
-    }
+    }?;
+    finalize_bench_result(result, prompt, strict_prompt_size)
 }
 
 /// Base URL for a running Ferrum server.
@@ -1045,6 +1154,15 @@ impl BenchResult {
         println!("  Model:    {}", self.model);
         println!("  Provider: {}", self.provider);
         println!("  Runs:     {}", self.summary.num_runs);
+        if let (Some(requested), Some(measured)) =
+            (self.requested_prompt_tokens, self.measured_prompt_tokens)
+        {
+            let delta = self
+                .prompt_token_delta_pct
+                .map(|d| format!(" ({d:+.1}%)"))
+                .unwrap_or_default();
+            println!("  Prompt:   requested {requested}, measured {measured:.1}{delta}");
+        }
         println!();
         println!(
             "  TPS:      {:.1} avg  ({:.1} min / {:.1} max)",
@@ -1246,7 +1364,7 @@ mod tests {
     #[test]
     fn openai_chat_uses_llamacpp_timings_when_present() {
         let url = serve_fixture(CHAT_COMPLETION_LLAMACPP_TIMINGS_FIXTURE);
-        let run = openai_chat(&url, "test-model", "Say hello.", 100)
+        let run = openai_chat(&url, "test-model", "Say hello.", 100, false)
             .expect("fixture chat should succeed");
         assert!((run.ttft_ms.unwrap() - 40.0).abs() < 0.01);
         assert!((run.tps - 25.0).abs() < 0.01);
@@ -1270,7 +1388,7 @@ mod tests {
     #[test]
     fn openai_chat_reports_prompt_eval_count_from_timings() {
         let url = serve_fixture(CHAT_COMPLETION_LLAMACPP_TIMINGS_FIXTURE);
-        let run = openai_chat(&url, "test-model", "Say hello.", 100)
+        let run = openai_chat(&url, "test-model", "Say hello.", 100, false)
             .expect("fixture chat should succeed");
         assert_eq!(run.prompt_eval_count, Some(128));
         assert!(run.load_ms.is_none());
@@ -1291,6 +1409,74 @@ mod tests {
         let json: serde_json::Value = serde_json::to_value(&run).expect("serialize");
         assert!(json.get("load_ms").is_none());
         assert!(json.get("prompt_eval_count").is_none());
+    }
+
+    fn sample_bench_run(prompt_eval_count: Option<u32>) -> BenchRun {
+        BenchRun {
+            ttft_ms: Some(10.0),
+            tps: 5.0,
+            prefill_tps: None,
+            total_ms: 100.0,
+            prompt_tokens: prompt_eval_count.unwrap_or(1),
+            output_tokens: 2,
+            load_ms: None,
+            prompt_eval_count,
+        }
+    }
+
+    fn sample_bench_result(runs: Vec<BenchRun>) -> BenchResult {
+        let summary = BenchSummary::from_runs(&runs);
+        BenchResult {
+            model: "m".to_string(),
+            provider: "ollama".to_string(),
+            runs,
+            summary,
+            requested_prompt_tokens: None,
+            measured_prompt_tokens: None,
+            prompt_token_delta_pct: None,
+        }
+    }
+
+    #[test]
+    fn finalize_bench_result_delta_and_strict_limit() {
+        let runs = vec![sample_bench_run(Some(100)), sample_bench_run(Some(102))];
+        let result = sample_bench_result(runs);
+        let spec = BenchPromptSpec {
+            text: "body".to_string(),
+            requested_tokens: Some(100),
+        };
+        let out = finalize_bench_result(result, Some(&spec), false).expect("within tolerance");
+        assert_eq!(out.requested_prompt_tokens, Some(100));
+        assert!((out.measured_prompt_tokens.unwrap() - 101.0).abs() < 0.01);
+        assert!((out.prompt_token_delta_pct.unwrap() - 1.0).abs() < 0.01);
+
+        let strict_runs = vec![sample_bench_run(Some(50))];
+        let strict_result = sample_bench_result(strict_runs);
+        let err = finalize_bench_result(strict_result, Some(&spec), true).unwrap_err();
+        assert!(err.contains("strict limit 2%"));
+    }
+
+    #[test]
+    fn finalize_bench_result_rejects_zero_requested_tokens() {
+        let result = sample_bench_result(vec![sample_bench_run(Some(10))]);
+        let spec = BenchPromptSpec {
+            text: "x".to_string(),
+            requested_tokens: Some(0),
+        };
+        let err = finalize_bench_result(result, Some(&spec), false).unwrap_err();
+        assert!(err.contains("at least 1"));
+    }
+
+    #[test]
+    fn prompt_for_run_adds_run_nonce_for_custom_prompt() {
+        let spec = BenchPromptSpec {
+            text: "hello".to_string(),
+            requested_tokens: Some(10),
+        };
+        let p0 = prompt_for_run(Some(&spec), 0);
+        let p1 = prompt_for_run(Some(&spec), 1);
+        assert!(p0.starts_with("Run-ID: 0001\n"));
+        assert!(p1.starts_with("Run-ID: 0002\n"));
     }
 
     #[test]
@@ -1316,14 +1502,14 @@ mod tests {
     fn openai_chat_derives_decode_tps_from_predicted_n_and_ms() {
         let body = r#"{"choices":[{"message":{"content":"x"}}],"usage":{"prompt_tokens":1,"completion_tokens":10},"timings":{"prompt_n":10,"prompt_ms":5.0,"predicted_n":10,"predicted_ms":500.0,"predicted_per_second":0.0}}"#;
         let url = serve_fixture(body);
-        let run = openai_chat(&url, "m", "p", 100).expect("fixture");
+        let run = openai_chat(&url, "m", "p", 100, false).expect("fixture");
         assert!((run.tps - 20.0).abs() < 0.01);
     }
 
     #[test]
     fn openai_chat_without_timings_keeps_wall_clock_tps_and_no_ttft() {
         let url = serve_fixture(CHAT_COMPLETION_FIXTURE);
-        let run = openai_chat(&url, "test-model", "Say hello.", 100)
+        let run = openai_chat(&url, "test-model", "Say hello.", 100, false)
             .expect("fixture chat should succeed");
         assert_eq!(run.ttft_ms, None);
         assert_eq!(run.output_tokens, 2);
@@ -1334,7 +1520,7 @@ mod tests {
     fn openai_wall_clock_spans_body_read() {
         let url =
             serve_fixture_with_body_delay(CHAT_COMPLETION_FIXTURE, Duration::from_millis(500));
-        let run = openai_chat(&url, "test-model", "Say hello.", 100)
+        let run = openai_chat(&url, "test-model", "Say hello.", 100, false)
             .expect("fixture chat should succeed");
         assert!(
             run.total_ms >= 400.0,
@@ -1539,6 +1725,26 @@ mod tests {
     }
 
     #[test]
+    fn custom_prompt_is_rejected_for_non_ollama_llamacpp_targets() {
+        let spec = crate::bench_prompt::BenchPromptSpec {
+            text: "benchmark prompt".to_string(),
+            requested_tokens: Some(128),
+        };
+        let err = benchmark_target(
+            &BenchTarget::Ferrum {
+                url: "http://127.0.0.1:9".to_string(),
+                model: "ferrum".to_string(),
+            },
+            1,
+            &|_, _| {},
+            Some(&spec),
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains("ollama and llamacpp"));
+    }
+
+    #[test]
     fn ferrum_target_keeps_json_provider_attribution() {
         let url = serve_fixture(CHAT_COMPLETION_FIXTURE);
         let result = benchmark_target(
@@ -1548,6 +1754,8 @@ mod tests {
             },
             1,
             &|_, _| {},
+            None,
+            false,
         )
         .expect("Ferrum OpenAI-compatible benchmark should succeed");
 

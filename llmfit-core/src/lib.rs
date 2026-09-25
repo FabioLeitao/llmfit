@@ -1,5 +1,6 @@
 pub mod analysis;
 pub mod bench;
+pub mod bench_prompt;
 pub mod benchmark_model_id;
 pub mod benchmarks;
 pub mod claim;

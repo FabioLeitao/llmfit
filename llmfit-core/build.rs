@@ -11,6 +11,7 @@ use std::path::{Component, Path, PathBuf};
 fn main() {
     println!("cargo:rerun-if-changed=data/community");
     println!("cargo:rerun-if-changed=data/hardware");
+    println!("cargo:rerun-if-changed=data/bench_sizing_en.txt");
 
     emit_git_build_sha();
     embed_community_benchmarks();

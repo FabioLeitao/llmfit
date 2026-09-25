@@ -19,6 +19,7 @@ use std::thread;
 use std::time::Duration;
 
 use llmfit_core::bench;
+use llmfit_core::bench_prompt;
 use llmfit_core::fit::{CalcConfig, ModelFit, SortColumn};
 use llmfit_core::hardware::SystemSpecs;
 use llmfit_core::hwprofile::HardwareProfile;
@@ -37,6 +38,14 @@ fn parse_positive_usize(value: &str) -> Result<usize, String> {
     if parsed == 0 {
         return Err("value must be at least 1".to_string());
     }
+    Ok(parsed)
+}
+
+fn parse_bench_prompt_tokens(value: &str) -> Result<u32, String> {
+    let parsed = value
+        .parse::<u32>()
+        .map_err(|_| format!("invalid unsigned integer: {value}"))?;
+    bench_prompt::validate_prompt_tokens(parsed)?;
     Ok(parsed)
 }
 
@@ -1034,6 +1043,22 @@ AGENT USAGE:
         /// command (use `bench --share` alone to upload stored results).
         #[arg(long)]
         no_store: bool,
+
+        /// Approximate prompt length in tokens (Ollama and llamacpp only).
+        /// Without a tokenizer the text is sized by character estimate; compare
+        /// `requested_prompt_tokens` vs `measured_prompt_tokens` in the output.
+        /// Chat templates may add tokens beyond this target.
+        #[arg(long, value_parser = parse_bench_prompt_tokens)]
+        prompt_tokens: Option<u32>,
+
+        /// Read benchmark prompt text from a file (Ollama and llamacpp only).
+        #[arg(long, value_name = "PATH")]
+        prompt_file: Option<std::path::PathBuf>,
+
+        /// Fail when measured prompt tokens deviate more than 2% from
+        /// `--prompt-tokens` (requires `--prompt-tokens`).
+        #[arg(long, requires = "prompt_tokens")]
+        strict_prompt_size: bool,
     },
 }
 
@@ -3042,9 +3067,40 @@ fn run_bench(
     json: bool,
     share_opts: Option<share::ShareOptions>,
     no_store: bool,
+    prompt_tokens: Option<u32>,
+    prompt_file: Option<std::path::PathBuf>,
+    strict_prompt_size: bool,
     overrides: &HardwareOverrides,
 ) {
     let runs = runs as usize;
+
+    if strict_prompt_size && prompt_tokens.is_none() {
+        eprintln!("Error: --strict-prompt-size requires --prompt-tokens");
+        std::process::exit(1);
+    }
+
+    let prompt_spec =
+        match bench_prompt::resolve_bench_prompt(prompt_file.as_deref(), prompt_tokens) {
+            Ok(spec) => spec,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        };
+
+    if prompt_spec.is_some() {
+        let provider_key = provider.to_lowercase();
+        let supported = matches!(
+            provider_key.as_str(),
+            "auto" | "ollama" | "llamacpp" | "llama.cpp" | "llama-server"
+        );
+        if !supported {
+            eprintln!(
+                "Error: --prompt-file and --prompt-tokens are only supported for ollama and llamacpp"
+            );
+            std::process::exit(1);
+        }
+    }
 
     if no_store && share_opts.is_some() {
         eprintln!(
@@ -3103,7 +3159,13 @@ fn run_bench(
                 }
             };
 
-            let result = bench::benchmark_target(target, runs, &progress);
+            let result = bench::benchmark_target(
+                target,
+                runs,
+                &progress,
+                prompt_spec.as_ref(),
+                strict_prompt_size,
+            );
 
             if !json {
                 eprintln!();
@@ -3240,7 +3302,13 @@ fn run_bench(
         }
     };
 
-    let result = bench::benchmark_target(&target, runs, &progress);
+    let result = bench::benchmark_target(
+        &target,
+        runs,
+        &progress,
+        prompt_spec.as_ref(),
+        strict_prompt_size,
+    );
 
     if !json {
         eprintln!();
@@ -4133,6 +4201,9 @@ fn main() {
                 dry_run,
                 yes,
                 no_store,
+                prompt_tokens,
+                prompt_file,
+                strict_prompt_size,
             } => {
                 // No model/flags → launch bench TUI view
                 let is_bare = model.is_none() && !all && !json && !quality && !routing && !share;
@@ -4169,7 +4240,18 @@ fn main() {
                         assume_yes: yes,
                     });
                     run_bench(
-                        model, &provider, url, runs, all, json, share_opts, no_store, &overrides,
+                        model,
+                        &provider,
+                        url,
+                        runs,
+                        all,
+                        json,
+                        share_opts,
+                        no_store,
+                        prompt_tokens,
+                        prompt_file,
+                        strict_prompt_size,
+                        &overrides,
                     );
                 }
             }

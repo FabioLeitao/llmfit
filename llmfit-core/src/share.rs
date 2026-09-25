@@ -1302,6 +1302,9 @@ mod tests {
                 avg_total_ms: 812.5,
                 avg_output_tokens: 104.0,
             },
+            requested_prompt_tokens: None,
+            measured_prompt_tokens: None,
+            prompt_token_delta_pct: None,
         }
     }
 
@@ -1320,6 +1323,9 @@ mod tests {
                 avg_total_ms: 3100.0,
                 avg_output_tokens: 300.0,
             },
+            requested_prompt_tokens: None,
+            measured_prompt_tokens: None,
+            prompt_token_delta_pct: None,
         }
     }
 
@@ -1492,6 +1498,9 @@ mod tests {
                 avg_total_ms: 812.5,
                 avg_output_tokens: 104.0,
             },
+            requested_prompt_tokens: None,
+            measured_prompt_tokens: None,
+            prompt_token_delta_pct: None,
         };
         // llama-server results are labeled "llamacpp" — must be schema-valid too.
         let llamacpp_result = BenchResult {
@@ -1507,6 +1516,9 @@ mod tests {
                 avg_total_ms: 2400.0,
                 avg_output_tokens: 100.0,
             },
+            requested_prompt_tokens: None,
+            measured_prompt_tokens: None,
+            prompt_token_delta_pct: None,
         };
         let ferrum_result = sample_ferrum_result();
 
