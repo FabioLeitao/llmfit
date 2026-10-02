@@ -80,12 +80,16 @@ pub struct QualityResult {
     pub composite: f64,
     /// First 150 chars of the model response.
     pub response_preview: String,
-    /// Time to first token in milliseconds (if available).
+    /// Prompt prefill duration in milliseconds when reported (Ollama
+    /// `prompt_eval_duration`; not true streaming TTFT).
     pub ttft_ms: Option<f64>,
     /// Total wall-clock time in seconds.
     pub wall_time_sec: f64,
     /// Number of output tokens.
     pub eval_tokens: u64,
+    /// Prompt tokens processed when the provider reports them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<u64>,
     /// Error message if the test failed.
     pub error: Option<String>,
 }
@@ -176,6 +180,7 @@ pub struct InferenceResponse {
     pub tok_per_sec: f64,
     pub ttft_ms: Option<f64>,
     pub wall_time_sec: f64,
+    pub prompt_tokens: Option<u64>,
 }
 
 fn ollama_request_body(
@@ -245,6 +250,7 @@ pub fn quality_ollama_generate(
         tok_per_sec,
         ttft_ms,
         wall_time_sec: wall_time.as_secs_f64(),
+        prompt_tokens: resp_body.prompt_eval_count,
     })
 }
 
@@ -303,6 +309,7 @@ fn quality_openai_chat(
         tok_per_sec,
         ttft_ms: None,
         wall_time_sec: wall_time.as_secs_f64(),
+        prompt_tokens: (usage.prompt_tokens > 0).then_some(usage.prompt_tokens as u64),
     })
 }
 
@@ -400,6 +407,7 @@ where
                         ttft_ms: resp.ttft_ms,
                         wall_time_sec: resp.wall_time_sec,
                         eval_tokens: resp.eval_count,
+                        prompt_tokens: resp.prompt_tokens,
                         error: None,
                     }
                 }
@@ -413,6 +421,7 @@ where
                     ttft_ms: None,
                     wall_time_sec: 0.0,
                     eval_tokens: 0,
+                    prompt_tokens: None,
                     error: Some(e),
                 },
             };
@@ -891,6 +900,25 @@ roles:
             ),
             9.0
         );
+    }
+
+    #[test]
+    fn quality_result_json_omits_absent_prompt_tokens() {
+        let result = QualityResult {
+            test_name: "t".to_string(),
+            role: "general".to_string(),
+            quality: 1.0,
+            tok_per_sec: 2.0,
+            composite: 1.5,
+            response_preview: String::new(),
+            ttft_ms: None,
+            wall_time_sec: 1.0,
+            eval_tokens: 3,
+            prompt_tokens: None,
+            error: None,
+        };
+        let json: serde_json::Value = serde_json::to_value(&result).expect("serialize");
+        assert!(json.get("prompt_tokens").is_none());
     }
 
     #[test]

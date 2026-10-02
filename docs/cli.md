@@ -98,7 +98,13 @@ python3 scripts/test_api.py --base-url http://127.0.0.1:8787
 ### Contributing benchmarks (`bench --share`)
 
 `llmfit bench` measures inference performance against a running provider
-(Ollama, vLLM, Ferrum, MLX, or llama-server). vLLM and Ferrum are distinguished
+(Ollama, vLLM, Ferrum, MLX, or llama-server). Decode tok/s (`tps`) uses
+native decode timers when the API exposes them (Ollama `eval_duration`,
+llama-server `timings.predicted_*`); otherwise it falls back to wall-clock
+throughput over the full response. The JSON field `ttft_ms` is **prompt
+prefill duration** (Ollama `prompt_eval_duration`, llama.cpp `prompt_ms`), not
+streaming time-to-first-token; `prefill_tps` and `prompt_tokens` are included
+when the provider reports them. vLLM and Ferrum are distinguished
 by the `owned_by` identity in `/v1/models`; set `FERRUM_HOST` to override
 Ferrum's default `http://localhost:8000` endpoint. llama-server is
 auto-detected on port 8080 via its `/props` endpoint (override with
